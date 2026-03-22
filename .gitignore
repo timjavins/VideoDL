@@ -1,0 +1,6 @@
+backend/target/
+__pycache__/
+*.pyc
+.env
+.vscode/
+logs/
