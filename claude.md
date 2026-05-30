@@ -19,3 +19,17 @@ Build a reliable, inspectable downloader system with conservative error handling
 ## Safety and compliance posture
 - Download only content users are authorized to access.
 - Keep platform terms and local laws in mind.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues via `gh` for this repo. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default label vocabulary for the five triage roles. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context docs at the repo root with `CONTEXT.md` and `docs/adr/`. See `docs/agents/domain.md`.
