@@ -11,6 +11,8 @@ VideoDL is a two-process app:
 - Exposes quality options and subtitle options
 - Starts download with selected quality and subtitles
 - Polls progress, ETA, and terminal status
+- Supports canceling active downloads from the GUI
+- Persists GUI download history across app restarts
 
 ## Requirements
 - `yt-dlp` installed and available on PATH
@@ -30,7 +32,7 @@ cargo run
 ```powershell
 cd frontend
 python -m pip install -r requirements.txt
-python headless_client.py --url "https://www.youtube.com/watch?v=gp9rLUqg-fQ"
+python headless_client.py --url "https://www.youtube.com/watch?v=NRfCFf-vlEk"
 ```
 
 ### 3) Run GUI client
@@ -45,6 +47,8 @@ GUI flow:
 - Choose quality from dropdown (defaults to highest from backend)
 - Optional: choose subtitle languages and format
 - Click Go to start download and watch live progress/ETA
+- Optional: click Cancel to stop an active download
+- Review persisted results in the Download History panel
 
 ## Notes
 - You can pass a direct media URL, but those can expire. User-facing page URLs are more stable.

@@ -14,13 +14,28 @@ def inspect_video(url: str) -> Dict[str, Any]:
     return response.json()
 
 
-def start_download(url: str, format_id: str, subtitle_langs: List[str], subtitle_format: str) -> str:
+def start_download(
+    url: str,
+    format_id: str,
+    subtitle_langs: List[str],
+    subtitle_format: str,
+    quality_height: int | None = None,
+    quality_has_audio: bool | None = None,
+    split_mode: bool = False,
+    split_video: bool = True,
+    split_audio: bool = True,
+) -> str:
     payload = {
         "url": url,
         "format_id": format_id,
+        "quality_height": quality_height,
+        "quality_has_audio": quality_has_audio,
         "subtitle_langs": subtitle_langs,
         "subtitle_format": subtitle_format,
         "output_dir": None,
+        "split_mode": split_mode,
+        "split_video": split_video,
+        "split_audio": split_audio,
     }
     response = requests.post(f"{API_BASE}/api/download", json=payload, timeout=60)
     response.raise_for_status()
@@ -56,7 +71,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Headless test client for VideoDL backend")
     parser.add_argument(
         "--url",
-        default="https://www.youtube.com/watch?v=gp9rLUqg-fQ",
+        default="https://www.youtube.com/watch?v=NRfCFf-vlEk",
         help="Video URL. You can pass a direct media URL or a user-facing URL.",
     )
     parser.add_argument(
@@ -118,6 +133,11 @@ def main() -> None:
         if status.get("status") in {"completed", "failed"}:
             print("Final status JSON:")
             print(json.dumps(status, indent=2))
+            output_paths = status.get("output_paths") or []
+            if output_paths:
+                print("Output paths:")
+                for output_path in output_paths:
+                    print("  -", output_path)
             break
 
         time.sleep(args.poll_seconds)
