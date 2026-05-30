@@ -11,10 +11,12 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::time::Instant;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command,
     sync::RwLock,
+    time::{sleep, Duration},
 };
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
@@ -34,9 +36,14 @@ struct InspectRequest {
 struct DownloadRequest {
     url: String,
     format_id: Option<String>,
+    quality_height: Option<u64>,
+    quality_has_audio: Option<bool>,
     subtitle_langs: Vec<String>,
     subtitle_format: Option<String>,
     output_dir: Option<String>,
+    split_mode: Option<bool>,
+    split_video: Option<bool>,
+    split_audio: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,13 +78,30 @@ struct SubtitleOption {
 struct DownloadTask {
     task_id: String,
     status: String,
+    cancel_requested: bool,
+    phase: String,
+    download_percent_raw: Option<f32>,
     progress_percent: f32,
     eta: Option<String>,
     output_path: Option<String>,
+    output_paths: Vec<String>,
     last_message: Option<String>,
     error: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PassProgressRange {
+    start: f32,
+    span: f32,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadPass {
+    label: &'static str,
+    format_selector: String,
+    output_suffix: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +125,7 @@ async fn main() {
         .route("/api/inspect", post(inspect_video))
         .route("/api/download", post(start_download))
         .route("/api/download/{task_id}", get(download_status))
+        .route("/api/download/{task_id}/cancel", post(cancel_download))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -153,15 +178,23 @@ async fn start_download(
     State(state): State<AppState>,
     Json(req): Json<DownloadRequest>,
 ) -> Result<Json<DownloadStartResponse>, ApiError> {
+    if let Err(err) = build_download_passes(&req) {
+        return Err(ApiError::bad_request(&err.to_string()));
+    }
+
     let task_id = Uuid::new_v4().to_string();
     let now = Utc::now();
 
     let task = DownloadTask {
         task_id: task_id.clone(),
         status: "queued".to_string(),
+        cancel_requested: false,
+        phase: "queued".to_string(),
+        download_percent_raw: None,
         progress_percent: 0.0,
         eta: None,
         output_path: None,
+        output_paths: Vec::new(),
         last_message: Some("Task queued".to_string()),
         error: None,
         created_at: now,
@@ -203,9 +236,54 @@ async fn download_status(
     Ok(Json(task))
 }
 
+async fn cancel_download(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+) -> Result<Json<DownloadTask>, ApiError> {
+    let mut tasks = state.tasks.write().await;
+    let task = tasks
+        .get_mut(&task_id)
+        .ok_or_else(|| ApiError::not_found("Task not found"))?;
+
+    match task.status.as_str() {
+        "completed" | "failed" | "cancelled" => {
+            return Err(ApiError::conflict("Task is already in a terminal state"));
+        }
+        _ => {}
+    }
+
+    task.cancel_requested = true;
+    if task.status == "queued" {
+        task.status = "cancelled".to_string();
+        task.phase = "cancelled".to_string();
+        task.progress_percent = 0.0;
+        task.last_message = Some("Cancelled before download started".to_string());
+    } else {
+        task.status = "cancelling".to_string();
+        task.phase = "cancelling".to_string();
+        task.last_message = Some("Cancellation requested".to_string());
+    }
+    task.updated_at = Utc::now();
+
+    Ok(Json(task.clone()))
+}
+
 async fn run_download_task(state: AppState, task_id: String, req: DownloadRequest) -> Result<()> {
+    if is_cancel_requested(&state, &task_id).await {
+        update_task(&state, &task_id, |task| {
+            task.status = "cancelled".to_string();
+            task.phase = "cancelled".to_string();
+            task.last_message = Some("Cancelled before process start".to_string());
+            task.updated_at = Utc::now();
+        })
+        .await;
+        return Ok(());
+    }
+
     update_task(&state, &task_id, |task| {
         task.status = "running".to_string();
+        task.phase = "preparing".to_string();
+        task.progress_percent = 3.0;
         task.last_message = Some("Preparing yt-dlp command".to_string());
         task.updated_at = Utc::now();
     })
@@ -213,10 +291,122 @@ async fn run_download_task(state: AppState, task_id: String, req: DownloadReques
 
     let output_dir = req
         .output_dir
+        .clone()
         .map(PathBuf::from)
         .or_else(dirs::download_dir)
         .ok_or_else(|| anyhow!("Could not determine download directory"))?;
+    let passes = build_download_passes(&req)?;
+    let total_passes = passes.len();
 
+    for (pass_index, pass) in passes.iter().enumerate() {
+        if is_cancel_requested(&state, &task_id).await {
+            update_task(&state, &task_id, |task| {
+                task.status = "cancelled".to_string();
+                task.phase = "cancelled".to_string();
+                task.last_message = Some("Cancelled before next download pass".to_string());
+                task.updated_at = Utc::now();
+            })
+            .await;
+            return Ok(());
+        }
+
+        let range = PassProgressRange {
+            start: (pass_index as f32) * (100.0 / total_passes as f32),
+            span: 100.0 / total_passes as f32,
+        };
+
+        run_single_download_pass(&state, &task_id, &req, &output_dir, pass, range).await?;
+    }
+
+    update_task(&state, &task_id, |task| {
+        task.status = "completed".to_string();
+        task.phase = "completed".to_string();
+        task.download_percent_raw = Some(100.0);
+        task.progress_percent = 100.0;
+        task.last_message = Some("Download completed".to_string());
+        task.updated_at = Utc::now();
+    })
+    .await;
+
+    Ok(())
+}
+
+fn build_download_passes(req: &DownloadRequest) -> Result<Vec<DownloadPass>> {
+    let split_mode = req.split_mode.unwrap_or(false);
+    if !split_mode {
+        let selector = req
+            .format_id
+            .clone()
+            .unwrap_or_else(|| "bestvideo+bestaudio/best".to_string());
+        return Ok(vec![DownloadPass {
+            label: "merged",
+            format_selector: selector,
+            output_suffix: None,
+        }]);
+    }
+
+    let split_video = req.split_video.unwrap_or(true);
+    let split_audio = req.split_audio.unwrap_or(true);
+
+    if !split_video && !split_audio {
+        return Err(anyhow!("Split mode requires at least one of video or audio"));
+    }
+
+    let mut passes = Vec::new();
+
+    if split_video {
+        passes.push(DownloadPass {
+            label: "video",
+            format_selector: build_split_video_selector(req),
+            output_suffix: Some("video"),
+        });
+    }
+
+    if split_audio {
+        passes.push(DownloadPass {
+            label: "audio",
+            format_selector: build_split_audio_selector(),
+            output_suffix: Some("audio"),
+        });
+    }
+
+    Ok(passes)
+}
+
+fn build_split_video_selector(req: &DownloadRequest) -> String {
+    if req.quality_has_audio == Some(false) {
+        return req
+            .format_id
+            .clone()
+            .unwrap_or_else(|| "bestvideo".to_string());
+    }
+
+    if let Some(height) = req.quality_height {
+        return format!("bestvideo[height<={height}]/bestvideo");
+    }
+
+    "bestvideo".to_string()
+}
+
+fn build_split_audio_selector() -> String {
+    "bestaudio/best".to_string()
+}
+
+fn build_output_template(suffix: Option<&str>) -> String {
+    match suffix {
+        Some(suffix) => format!("%(title)s_{suffix}.%(ext)s"),
+        None => "%(title)s.%(ext)s".to_string(),
+    }
+}
+
+async fn run_single_download_pass(
+    state: &AppState,
+    task_id: &str,
+    req: &DownloadRequest,
+    output_dir: &PathBuf,
+    pass: &DownloadPass,
+    range: PassProgressRange,
+) -> Result<()> {
     let mut args = vec![
         "--newline".to_string(),
         "--no-playlist".to_string(),
@@ -225,22 +415,17 @@ async fn run_download_task(state: AppState, task_id: String, req: DownloadReques
         "-P".to_string(),
         output_dir.to_string_lossy().to_string(),
         "-o".to_string(),
-        "%(title)s.%(ext)s".to_string(),
+        build_output_template(pass.output_suffix),
+        "-f".to_string(),
+        pass.format_selector.clone(),
     ];
-
-    let format_selector = req
-        .format_id
-        .clone()
-        .unwrap_or_else(|| "bestvideo+bestaudio/best".to_string());
-    args.push("-f".to_string());
-    args.push(format_selector);
 
     if !req.subtitle_langs.is_empty() {
         args.push("--write-subs".to_string());
         args.push("--write-auto-subs".to_string());
         args.push("--sub-langs".to_string());
         args.push(req.subtitle_langs.join(","));
-        if let Some(sub_format) = req.subtitle_format {
+        if let Some(sub_format) = req.subtitle_format.clone() {
             args.push("--sub-format".to_string());
             args.push(sub_format);
         }
@@ -251,65 +436,112 @@ async fn run_download_task(state: AppState, task_id: String, req: DownloadReques
         args.push(ffmpeg_location);
     }
 
-    args.push(req.url);
+    args.push(req.url.clone());
 
     let mut cmd = Command::new(ytdlp_executable());
     cmd.args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
-    info!(task_id = %task_id, "spawning yt-dlp process");
+    info!(task_id = %task_id, pass = pass.label, "spawning yt-dlp process");
+    update_task(state, task_id, |task| {
+        task.phase = "starting".to_string();
+        task.progress_percent = task.progress_percent.max(range.start + (range.span * 0.08));
+        task.last_message = Some(format!("Starting {} download pass", pass.label));
+        task.updated_at = Utc::now();
+    })
+    .await;
+
     let mut child = cmd.spawn().context("failed to spawn yt-dlp")?;
+    let started = Instant::now();
 
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("missing stdout"))?;
     let stderr = child.stderr.take().ok_or_else(|| anyhow!("missing stderr"))?;
 
     let state_stdout = state.clone();
-    let task_stdout = task_id.clone();
+    let task_stdout = task_id.to_string();
     let stdout_handle = tokio::spawn(async move {
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            process_output_line(&state_stdout, &task_stdout, &line).await;
+            process_output_line(&state_stdout, &task_stdout, &line, range).await;
         }
     });
 
     let state_stderr = state.clone();
-    let task_stderr = task_id.clone();
+    let task_stderr = task_id.to_string();
     let stderr_handle = tokio::spawn(async move {
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            process_output_line(&state_stderr, &task_stderr, &line).await;
+            process_output_line(&state_stderr, &task_stderr, &line, range).await;
         }
     });
 
-    let status = child.wait().await.context("failed waiting for yt-dlp")?;
-    let _ = stdout_handle.await;
-    let _ = stderr_handle.await;
+    loop {
+        let elapsed_secs = started.elapsed().as_secs_f32();
+        maybe_update_heartbeat_progress(state, task_id, elapsed_secs, range).await;
 
-    if status.success() {
-        update_task(&state, &task_id, |task| {
-            task.status = "completed".to_string();
-            task.progress_percent = 100.0;
-            task.last_message = Some("Download completed".to_string());
-            task.updated_at = Utc::now();
-        })
-        .await;
-    } else {
-        update_task(&state, &task_id, |task| {
-            task.status = "failed".to_string();
-            task.error = Some(format!("yt-dlp exited with status: {status}"));
-            task.updated_at = Utc::now();
-        })
-        .await;
+        if is_cancel_requested(state, task_id).await {
+            update_task(state, task_id, |task| {
+                task.status = "cancelling".to_string();
+                task.phase = "cancelling".to_string();
+                task.last_message = Some(format!("Stopping {} download pass", pass.label));
+                task.updated_at = Utc::now();
+            })
+            .await;
+
+            if let Err(err) = child.kill().await {
+                warn!(task_id = %task_id, pass = pass.label, "failed to kill yt-dlp process: {err}");
+            }
+            let _ = child.wait().await;
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+
+            update_task(state, task_id, |task| {
+                task.status = "cancelled".to_string();
+                task.phase = "cancelled".to_string();
+                task.last_message = Some("Download cancelled by user".to_string());
+                task.updated_at = Utc::now();
+            })
+            .await;
+            return Ok(());
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .context("failed checking yt-dlp process status")?
+        {
+            let _ = stdout_handle.await;
+            let _ = stderr_handle.await;
+
+            if status.success() {
+                update_task(state, task_id, |task| {
+                    task.download_percent_raw = Some(100.0);
+                    task.progress_percent = task.progress_percent.max(range.start + range.span);
+                    task.phase = "processing".to_string();
+                    task.last_message = Some(format!("{} download pass completed", pass.label));
+                    task.updated_at = Utc::now();
+                })
+                .await;
+            } else {
+                update_task(state, task_id, |task| {
+                    task.status = "failed".to_string();
+                    task.phase = "failed".to_string();
+                    task.error = Some(format!("yt-dlp exited with status: {status}"));
+                    task.updated_at = Utc::now();
+                })
+                .await;
+            }
+            return Ok(());
+        }
+
+        sleep(Duration::from_millis(400)).await;
     }
-
-    Ok(())
 }
 
-async fn process_output_line(state: &AppState, task_id: &str, line: &str) {
-    let progress_re = Regex::new(r"(?i)\[download\]\s+(\d+(?:\.\d+)?)%.*?(?:ETA\s+([^\s]+))?").ok();
+async fn process_output_line(state: &AppState, task_id: &str, line: &str, range: PassProgressRange) {
+    let progress_re = Regex::new(r"(?i)\[download\].*?(\d+(?:\.\d+)?)%.*?(?:ETA\s+([^\s]+))?").ok();
 
     if let Some(re) = progress_re {
         if let Some(caps) = re.captures(line) {
@@ -317,9 +549,12 @@ async fn process_output_line(state: &AppState, task_id: &str, line: &str) {
                 .get(1)
                 .and_then(|m| m.as_str().parse::<f32>().ok())
                 .unwrap_or(0.0);
+            let overall = map_download_to_overall(progress, range);
             let eta = caps.get(2).map(|m| m.as_str().to_string());
             update_task(state, task_id, |task| {
-                task.progress_percent = progress;
+                task.phase = "downloading".to_string();
+                task.download_percent_raw = Some(progress);
+                task.progress_percent = overall.max(task.progress_percent);
                 task.eta = eta;
                 task.last_message = Some(line.to_string());
                 task.updated_at = Utc::now();
@@ -329,8 +564,37 @@ async fn process_output_line(state: &AppState, task_id: &str, line: &str) {
         }
     }
 
-    if line.contains("[Merger]") || line.contains("Destination") || line.contains("Merging") {
+    if line.contains("[download]") {
         update_task(state, task_id, |task| {
+            task.phase = "downloading".to_string();
+            task.progress_percent = task.progress_percent.max(range.start + (range.span * 0.12));
+            task.last_message = Some(line.to_string());
+            task.updated_at = Utc::now();
+        })
+        .await;
+        return;
+    }
+
+    if line.contains("[Merger]")
+        || line.contains("Merging")
+        || line.contains("[ExtractAudio]")
+        || line.contains("Fixing")
+        || line.contains("Deleting original file")
+    {
+        update_task(state, task_id, |task| {
+            task.phase = "processing".to_string();
+            task.progress_percent = task.progress_percent.max(range.start + (range.span * 0.96));
+            task.last_message = Some(line.to_string());
+            task.updated_at = Utc::now();
+        })
+        .await;
+        return;
+    }
+
+    if line.contains("Destination:") {
+        update_task(state, task_id, |task| {
+            task.phase = "downloading".to_string();
+            task.progress_percent = task.progress_percent.max(range.start + (range.span * 0.12));
             task.last_message = Some(line.to_string());
             task.updated_at = Utc::now();
         })
@@ -350,6 +614,7 @@ async fn process_output_line(state: &AppState, task_id: &str, line: &str) {
     if line.contains("ERROR:") {
         update_task(state, task_id, |task| {
             task.status = "failed".to_string();
+            task.phase = "failed".to_string();
             task.error = Some(line.to_string());
             task.last_message = Some(line.to_string());
             task.updated_at = Utc::now();
@@ -358,15 +623,14 @@ async fn process_output_line(state: &AppState, task_id: &str, line: &str) {
         return;
     }
 
-    let looks_like_windows_path = Regex::new(r"^[A-Za-z]:[\\/].+")
-        .ok()
-        .map(|re| re.is_match(line.trim()))
-        .unwrap_or(false);
-    let looks_like_unix_path = line.trim().starts_with('/');
-
-    if looks_like_windows_path || looks_like_unix_path {
+    if let Some(path) = extract_output_path(line) {
         update_task(state, task_id, |task| {
-            task.output_path = Some(line.trim().to_string());
+            if task.output_path.is_none() {
+                task.output_path = Some(path.clone());
+            }
+            if !task.output_paths.iter().any(|existing| existing == &path) {
+                task.output_paths.push(path);
+            }
             task.last_message = Some("Final output path captured".to_string());
             task.updated_at = Utc::now();
         })
@@ -381,6 +645,25 @@ async fn process_output_line(state: &AppState, task_id: &str, line: &str) {
     .await;
 }
 
+fn extract_output_path(line: &str) -> Option<String> {
+    let trimmed = line.trim().trim_matches('"').trim_matches('(').trim_matches(')');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(value) = trimmed.split_once("Destination:").map(|(_, value)| value.trim()) {
+        if !value.is_empty() {
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+
+    let path_re = Regex::new(r#"([A-Za-z]:[\\/][^"\r\n]+|/[^"\r\n]+)"#).ok()?;
+    path_re
+        .captures(trimmed)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim_matches('"').to_string())
+}
+
 async fn update_task<F>(state: &AppState, task_id: &str, mutator: F)
 where
     F: FnOnce(&mut DownloadTask),
@@ -391,6 +674,14 @@ where
     } else {
         warn!(task_id = %task_id, "attempted to update missing task");
     }
+}
+
+async fn is_cancel_requested(state: &AppState, task_id: &str) -> bool {
+    let tasks = state.tasks.read().await;
+    tasks
+        .get(task_id)
+        .map(|task| task.cancel_requested)
+        .unwrap_or(false)
 }
 
 async fn run_yt_dlp_json(url: &str) -> Result<Value> {
@@ -545,6 +836,44 @@ fn extract_subtitles(metadata: &Value) -> Vec<SubtitleOption> {
     results
 }
 
+fn map_download_to_overall(download_percent: f32, range: PassProgressRange) -> f32 {
+    // Allocate most of overall progress to network transfer, while reserving room
+    // for startup and post-processing phases.
+    let clamped = download_percent.clamp(0.0, 100.0);
+    let overall = 12.0 + (clamped * 0.83);
+    range.start + (overall.min(95.0) * (range.span / 100.0))
+}
+
+async fn maybe_update_heartbeat_progress(
+    state: &AppState,
+    task_id: &str,
+    elapsed_secs: f32,
+    range: PassProgressRange,
+) {
+    update_task(state, task_id, |task| {
+        if task.status != "running" {
+            return;
+        }
+
+        if task.phase == "starting" && elapsed_secs > 5.0 {
+            task.phase = "downloading".to_string();
+            task.progress_percent = task.progress_percent.max(range.start + (range.span * 0.15));
+            task.last_message = Some(
+                "Download in progress (waiting for detailed progress from yt-dlp)".to_string(),
+            );
+            task.updated_at = Utc::now();
+            return;
+        }
+
+        if task.phase == "downloading" && task.download_percent_raw.is_none() {
+            let inferred = range.start + (range.span * 0.15) + (elapsed_secs * 0.18);
+            task.progress_percent = task.progress_percent.max(inferred.min(range.start + (range.span * 0.85)));
+            task.updated_at = Utc::now();
+        }
+    })
+    .await;
+}
+
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
@@ -559,9 +888,23 @@ impl ApiError {
         }
     }
 
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.to_string(),
+        }
+    }
+
     fn not_found(message: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.to_string(),
+        }
+    }
+
+    fn conflict(message: &str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.to_string(),
         }
     }
