@@ -12,7 +12,13 @@ Response fields:
 - `title`
 - `webpage_url`
 - `default_format_id`
-- `qualities[]` with `format_id`, `download_selector`, `label`, `height`, `fps`, `ext`, `filesize`, `has_audio`
+- `source_video_codec`
+- `source_audio_codec`
+- `source_container`
+- `source_classification` (`friendly`, `unfriendly`, or `unknown`)
+- `recommended_output_mode` (`natural` or `converted`)
+- `recommended_conversion_profile`
+- `qualities[]` with `format_id`, `download_selector`, `label`, `height`, `fps`, `ext`, `filesize`, `has_audio`, `vcodec`, `acodec`, `container`
 - `subtitles[]` with `language`, `kind` (`manual` or `auto`), `formats[]`
 
 ## POST /api/download
@@ -26,6 +32,8 @@ Request:
   "subtitle_langs": ["en", "en-US"],
   "subtitle_format": "srt",
   "output_dir": null,
+  "output_mode": "natural",
+  "conversion_profile": null,
   "split_mode": false,
   "split_video": true,
   "split_audio": true
@@ -42,6 +50,15 @@ Split mode behavior:
 - If both `split_video` and `split_audio` are `false`, the API returns `400` with a JSON error.
 - Video-only split output uses a `_video` filename suffix.
 - Audio-only split output uses a `_audio` filename suffix.
+
+Output mode behavior:
+- `output_mode: natural` keeps the source-adjacent download behavior.
+- `output_mode: converted` requests one converted output using `conversion_profile`.
+- `output_mode: both` requests both natural and converted outputs.
+- When `output_mode` includes converted output, `conversion_profile` selects the preset.
+- Conversion is performed explicitly with ffmpeg after the natural download completes.
+- Split mode supports the same output modes as merged downloads. Converted output is generated after each split pass completes.
+- When `output_mode` is omitted, the backend defaults to natural output.
 
 ## GET /api/download/{task_id}
 Response fields:
