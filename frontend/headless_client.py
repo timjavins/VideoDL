@@ -21,6 +21,8 @@ def start_download(
     subtitle_format: str,
     quality_height: int | None = None,
     quality_has_audio: bool | None = None,
+    output_mode: str = "natural",
+    conversion_profile: str | None = None,
     split_mode: bool = False,
     split_video: bool = True,
     split_audio: bool = True,
@@ -33,6 +35,8 @@ def start_download(
         "subtitle_langs": subtitle_langs,
         "subtitle_format": subtitle_format,
         "output_dir": None,
+        "output_mode": output_mode,
+        "conversion_profile": conversion_profile,
         "split_mode": split_mode,
         "split_video": split_video,
         "split_audio": split_audio,
@@ -81,6 +85,18 @@ def main() -> None:
         help="Subtitle format preference",
     )
     parser.add_argument(
+        "--output-mode",
+        default="natural",
+        choices=["natural", "converted", "both"],
+        help="Whether to download the natural output, converted output, or both",
+    )
+    parser.add_argument(
+        "--conversion-profile",
+        default=None,
+        choices=["mp4_h264_aac", "mov_prores", "m4a_aac", "wav"],
+        help="Conversion preset to use when output mode includes converted output",
+    )
+    parser.add_argument(
         "--poll-seconds",
         type=float,
         default=1.5,
@@ -92,6 +108,9 @@ def main() -> None:
     info = inspect_video(args.url)
     print("Title:", info.get("title"))
     print("Web page URL:", info.get("webpage_url"))
+    print("Source classification:", info.get("source_classification"))
+    print("Recommended output mode:", info.get("recommended_output_mode"))
+    print("Recommended conversion profile:", info.get("recommended_conversion_profile"))
 
     qualities = info.get("qualities", [])
     print(f"Found {len(qualities)} quality options")
@@ -103,6 +122,12 @@ def main() -> None:
             q.get("format_id"),
             "| selector=",
             q.get("download_selector"),
+            "| vcodec=",
+            q.get("vcodec"),
+            "| acodec=",
+            q.get("acodec"),
+            "| container=",
+            q.get("container"),
         )
 
     subtitles = info.get("subtitles", [])
@@ -115,11 +140,18 @@ def main() -> None:
     print("Selected format_id:", format_id)
     print("Selected subtitle languages:", subtitle_langs or "None")
 
+    output_mode = args.output_mode or info.get("recommended_output_mode") or "natural"
+    conversion_profile = args.conversion_profile or info.get("recommended_conversion_profile")
+    print("Selected output mode:", output_mode)
+    print("Selected conversion profile:", conversion_profile)
+
     task_id = start_download(
         url=args.url,
         format_id=format_id,
         subtitle_langs=subtitle_langs,
         subtitle_format=args.subtitle_format,
+        output_mode=output_mode,
+        conversion_profile=conversion_profile,
     )
     print("Task ID:", task_id)
 
