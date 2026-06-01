@@ -102,6 +102,11 @@ def main() -> None:
         default=1.5,
         help="How often to poll download status",
     )
+    parser.add_argument(
+        "--audio-only",
+        action="store_true",
+        help="Download audio track only (best quality)",
+    )
     args = parser.parse_args()
 
     print("Inspecting URL:", args.url)
@@ -135,7 +140,18 @@ def main() -> None:
     if subtitles:
         print("Subtitle sample:", json.dumps(subtitles[:5], indent=2))
 
-    format_id = choose_default_quality(qualities, info.get("default_format_id"))
+    if args.audio_only:
+        # Find audio-only quality (vcodec="none")
+        audio_qualities = [q for q in qualities if q.get("vcodec") == "none" or (q.get("vcodec") is None and q.get("has_audio"))]
+        if audio_qualities:
+            format_id = audio_qualities[0].get("download_selector") or audio_qualities[0]["format_id"]
+            print("Selected AUDIO-ONLY format:", format_id)
+        else:
+            print("WARNING: No audio-only format found, falling back to default")
+            format_id = choose_default_quality(qualities, info.get("default_format_id"))
+    else:
+        format_id = choose_default_quality(qualities, info.get("default_format_id"))
+    
     subtitle_langs = choose_default_subtitle_langs(subtitles)
     print("Selected format_id:", format_id)
     print("Selected subtitle languages:", subtitle_langs or "None")
