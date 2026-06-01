@@ -8,8 +8,9 @@ VideoDL is a two-process app:
 - Headless, observable workflow implemented
 - Tkinter GUI workflow implemented
 - Supports user-facing YouTube URL inspection
-- Exposes quality options and subtitle options
-- Starts download with selected quality and subtitles
+- Exposes quality options, including audio-only formats, and subtitle options
+- Starts download with selected quality, subtitles, and output mode
+- Supports natural, converted, and both output modes
 - Polls progress, ETA, and terminal status
 - Supports canceling active downloads from the GUI
 - Persists GUI download history across app restarts
@@ -46,6 +47,7 @@ GUI flow:
 - Click Inspect URL to fetch available qualities and subtitles
 - Choose quality from dropdown (defaults to highest from backend)
 - Optional: choose subtitle languages and format
+- Optional: choose natural, converted, or both output mode
 - Click Go to start download and watch live progress/ETA
 - Optional: click Cancel to stop an active download
 - Review persisted results in the Download History panel

@@ -21,6 +21,11 @@ Response fields:
 - `qualities[]` with `format_id`, `download_selector`, `label`, `height`, `fps`, `ext`, `filesize`, `has_audio`, `vcodec`, `acodec`, `container`
 - `subtitles[]` with `language`, `kind` (`manual` or `auto`), `formats[]`
 
+Quality list notes:
+- Video-only formats use a `download_selector` that appends `+bestaudio/best`
+- Merged formats use the raw `format_id`
+- Audio-only formats are included when available and use the raw `format_id`
+
 ## POST /api/download
 Request:
 ```json
@@ -56,7 +61,7 @@ Output mode behavior:
 - `output_mode: converted` requests one converted output using `conversion_profile`.
 - `output_mode: both` requests both natural and converted outputs.
 - When `output_mode` includes converted output, `conversion_profile` selects the preset.
-- Conversion is performed explicitly with ffmpeg after the natural download completes.
+- Converted output is produced with ffmpeg after the natural download completes, except for audio-only targets where yt-dlp can extract the final audio file directly.
 - Split mode supports the same output modes as merged downloads. Converted output is generated after each split pass completes.
 - When `output_mode` is omitted, the backend defaults to natural output.
 

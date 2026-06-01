@@ -32,7 +32,7 @@ Recommended signals for the classification:
 - whether the format is already merged or audio-only/video-only
 
 The current inspect payload already gives the GUI enough to know the selected quality, size, and whether audio is present.
-It does not yet expose codec names, so the final implementation should add explicit codec metadata instead of guessing from extension alone.
+It also exposes codec metadata and source/container classification, so the GUI can avoid guessing from extension alone.
 
 ## Default output policy
 Use the source classification to choose the initial output mode.
@@ -92,6 +92,10 @@ Recommended controls:
 - video target dropdown when the selected quality contains video
 - audio target dropdown when the selected quality is audio-only
 - a compact explanatory line that says why the selected preset was recommended
+
+Current behavior:
+- audio-only qualities are shown when available
+- audio-only converted output can be produced directly as the final audio file
 
 ## Suggested logic branch
 When the inspected quality is classified as `unfriendly`, open the conversion section automatically and show a warning banner.

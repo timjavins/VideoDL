@@ -7,10 +7,9 @@
 - Headless Python client for observability and validation
 
 ## Next scope
-- Tkinter GUI wiring for URL input, quality dropdown, subtitle controls, and go button
 - Real-time progress bar + ETA in GUI
 - Better error taxonomy and retry strategies
-- Codec choice and conversion guidance for editing-friendly outputs
+- Conversion preset explanations and fallback behavior for edge cases
 
 ## Out of scope (for now)
 - DRM-protected stream bypass
