@@ -458,6 +458,12 @@ async fn run_single_download_pass(
     pass: &DownloadPass,
     range: PassProgressRange,
 ) -> Result<()> {
+    let conversion_profile = req
+        .conversion_profile
+        .clone()
+        .unwrap_or_else(|| default_conversion_profile(req));
+    let direct_audio_conversion = should_use_direct_audio_conversion(req, pass, &conversion_profile);
+
     let mut args = vec![
         "--newline".to_string(),
         "--no-playlist".to_string(),
@@ -470,6 +476,14 @@ async fn run_single_download_pass(
         "-f".to_string(),
         pass.format_selector.clone(),
     ];
+
+    if direct_audio_conversion {
+        let audio_format = audio_conversion_format(&conversion_profile)
+            .ok_or_else(|| anyhow!("Unsupported audio conversion profile: {conversion_profile}"))?;
+        args.push("--extract-audio".to_string());
+        args.push("--audio-format".to_string());
+        args.push(audio_format.to_string());
+    }
 
     if !req.subtitle_langs.is_empty() {
         args.push("--write-subs".to_string());
@@ -571,15 +585,11 @@ async fn run_single_download_pass(
                 })
                 .await;
 
-                if should_run_explicit_conversion(req) {
+                if should_run_explicit_conversion(req) && !direct_audio_conversion {
                     let source_path = update_task_and_get_output_path(state, task_id).await;
                     if let Some(source_path) = source_path {
-                        let profile = req
-                            .conversion_profile
-                            .clone()
-                            .unwrap_or_else(|| default_conversion_profile(req));
                         let keep_source = req.output_mode.as_deref().unwrap_or("natural").trim() == "both";
-                        convert_with_ffmpeg(state, task_id, &source_path, &profile, keep_source).await?;
+                        convert_with_ffmpeg(state, task_id, &source_path, &conversion_profile, keep_source).await?;
                     }
                 }
             } else {
@@ -600,6 +610,24 @@ async fn run_single_download_pass(
 
 fn should_run_explicit_conversion(req: &DownloadRequest) -> bool {
     matches!(req.output_mode.as_deref().unwrap_or("natural"), "converted" | "both")
+}
+
+fn should_use_direct_audio_conversion(
+    req: &DownloadRequest,
+    pass: &DownloadPass,
+    conversion_profile: &str,
+) -> bool {
+    req.output_mode.as_deref().unwrap_or("natural").trim() == "converted"
+        && pass.label == "audio"
+        && audio_conversion_format(conversion_profile).is_some()
+}
+
+fn audio_conversion_format(profile: &str) -> Option<&'static str> {
+    match profile {
+        "m4a_aac" => Some("m4a"),
+        "wav" => Some("wav"),
+        _ => None,
+    }
 }
 
 async fn update_task_and_get_output_path(state: &AppState, task_id: &str) -> Option<String> {
@@ -786,7 +814,7 @@ async fn convert_with_ffmpeg(
                 task.updated_at = Utc::now();
             })
             .await;
-            return Ok(());
+            return Err(anyhow!("ffmpeg exited with status: {status}"));
         }
 
         sleep(Duration::from_millis(300)).await;
@@ -1011,7 +1039,10 @@ fn extract_qualities(metadata: &Value) -> Vec<QualityOption> {
     if let Some(formats) = metadata.get("formats").and_then(Value::as_array) {
         for fmt in formats {
             let vcodec = fmt.get("vcodec").and_then(Value::as_str).unwrap_or("");
-            if vcodec == "none" {
+            let acodec = fmt.get("acodec").and_then(Value::as_str).unwrap_or("");
+            
+            // Skip formats with no video AND no audio
+            if vcodec == "none" && acodec == "none" {
                 continue;
             }
 
@@ -1027,31 +1058,45 @@ fn extract_qualities(metadata: &Value) -> Vec<QualityOption> {
             let vcodec = fmt.get("vcodec").and_then(Value::as_str).map(str::to_string);
             let acodec = fmt.get("acodec").and_then(Value::as_str).map(str::to_string);
             let has_audio = acodec.as_deref().is_some_and(|codec| codec != "none");
+            let is_audio_only = vcodec.as_deref().is_some_and(|codec| codec == "none") && has_audio;
             let note = fmt
                 .get("format_note")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
 
-            let download_selector = if has_audio {
+            let download_selector = if is_audio_only {
+                // Audio-only format: use it directly
+                format_id.clone()
+            } else if has_audio {
+                // Video with audio: use directly
                 format_id.clone()
             } else {
+                // Video-only: auto-add bestaudio
                 format!("{}+bestaudio/best", format_id)
             };
 
-            let label = format!(
-                "{}p {} {} ({}){}",
-                height.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string()),
-                if fps.unwrap_or(0.0) > 0.0 {
-                    format!("{}fps", fps.unwrap_or(0.0))
-                } else {
-                    "".to_string()
-                },
-                note,
-                format_id,
-                if has_audio { "" } else { " + bestaudio" }
-            )
-            .trim()
-            .to_string();
+            let label = if is_audio_only {
+                format!("Audio only {} ({}) [{}]", 
+                    acodec.as_deref().unwrap_or("unknown"),
+                    format_id,
+                    ext.as_deref().unwrap_or("unknown")
+                )
+            } else {
+                format!(
+                    "{}p {} {} ({}){}",
+                    height.map(|h| h.to_string()).unwrap_or_else(|| "?".to_string()),
+                    if fps.unwrap_or(0.0) > 0.0 {
+                        format!("{}fps", fps.unwrap_or(0.0))
+                    } else {
+                        "".to_string()
+                    },
+                    note,
+                    format_id,
+                    if has_audio { "" } else { " + bestaudio" }
+                )
+                .trim()
+                .to_string()
+            };
 
             qualities.push(QualityOption {
                 format_id,
